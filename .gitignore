@@ -1,0 +1,6 @@
+# Forecast outputs and local scratch: never part of the entry.
+out/
+out2/
+*.out
+node_modules/
+.DS_Store
