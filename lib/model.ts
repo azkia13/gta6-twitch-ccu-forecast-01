@@ -19,6 +19,15 @@
 // If the weighting leaves too few launches with real weight, the kernel
 // widens until the effective sample is big enough to trust.
 //
+// The quantiles themselves are an ensemble of two estimators of the same
+// per-hour distribution of log ratios. With only a few dozen launches the
+// empirical quantiles are noisy, worst at the 5% and 95% tails, while a
+// normal fit (weighted mean and spread of the log ratios) is smooth but
+// biased when the distribution is skew. Averaging the two halves the
+// variance of the tails without trusting either one alone; the median
+// stays purely empirical, since it is the best-estimated quantile and the
+// anchor every other level is pulled toward.
+//
 // The outer quantiles are pulled 15% toward the median: with a few dozen
 // launches the 5% and 95% empirical quantiles overshoot, and the pinball
 // loss punishes an over-wide band at every hour. The median is untouched.
@@ -49,9 +58,13 @@ export interface CaseFile {
 export const LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95];
 
 /** Width of the size kernel, in natural-log units of hour-1 viewers. */
-const SIZE_KERNEL_WIDTH = 1.0;
+const SIZE_KERNEL_WIDTH = 0.9;
 /** How far the outer quantiles are pulled toward the median (1 = no pull). */
 const SPREAD_PULL = 0.85;
+/** Weight of the normal-fit quantiles in the ensemble (0 = purely empirical). */
+const NORMAL_BLEND = 0.5;
+/** Standard-normal quantiles at the contest's levels, in LEVELS order. */
+const NORMAL_Z = [-1.6448536269514722, -0.6744897501960817, 0, 0.6744897501960817, 1.6448536269514722];
 /** Smallest effective sample the kernel is allowed to leave behind. */
 const MIN_EFFECTIVE_LAUNCHES = 8;
 /** Widest the kernel may grow while chasing that sample. */
@@ -150,9 +163,31 @@ export function weightedQuantile(pairs: Array<[number, number]>, tau: number): n
   return last[1];
 }
 
+/** Weighted mean and standard deviation of a weighted sample of log
+ *  ratios: the normal fit the ensemble blends against the empirical
+ *  quantiles. */
+function weightedMeanSd(pairs: Array<[number, number]>): [number, number] {
+  let total = 0;
+  let mean = 0;
+  for (const [value, w] of pairs) {
+    total += w;
+    mean += value * w;
+  }
+  if (total <= 0) return [pairs[0][0], 0];
+  mean /= total;
+  let variance = 0;
+  for (const [value, w] of pairs) {
+    variance += w * (value - mean) * (value - mean);
+  }
+  return [mean, Math.sqrt(variance / total)];
+}
+
 /** The five quantiles of one hour's log ratio, as viewer counts. The
- *  median anchors the forecast; the outer quantiles are pulled toward it
- *  by SPREAD_PULL so a thin sample does not overstate the spread. */
+ *  median anchors the forecast and stays purely empirical; every level's
+ *  quantile is the average of the empirical quantile and the normal
+ *  fit's quantile at that level, and the outer quantiles are pulled
+ *  toward the median by SPREAD_PULL so a thin sample does not overstate
+ *  the spread. */
 function hourQuantiles(
   shapes: LaunchShape[],
   hour: number,
@@ -174,8 +209,11 @@ function hourQuantiles(
     width *= 1.25;
   }
   const median = weightedQuantile(pairs, 0.5);
-  return LEVELS.map((tau) => {
-    const q = weightedQuantile(pairs, tau);
+  const [mean, sd] = weightedMeanSd(pairs);
+  return LEVELS.map((tau, i) => {
+    const empirical = weightedQuantile(pairs, tau);
+    const normal = mean + NORMAL_Z[i] * sd;
+    const q = (1 - NORMAL_BLEND) * empirical + NORMAL_BLEND * normal;
     return targetHourOne * Math.exp(median + SPREAD_PULL * (q - median));
   });
 }

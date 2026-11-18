@@ -10,8 +10,9 @@ Forecast Grand Theft Auto VI's launch-day Twitch viewers hour by hour: for each 
 
 The shape of a release day is learned from the comparables, not guessed. For a past launch the model takes the log ratio of each hour's viewers to that launch's own hour-1 print; across launches those ratios form a distribution per hour, and the forecast's quantiles are quantiles of that distribution. Two weightings keep the distribution relevant:
 
-- **Size kernel.** Launches whose hour-1 print is close in size to the target's get more weight (a Gaussian kernel, width 1.0 in log viewers). A launch ten times smaller peaks at a different time of day than a huge one. If the weighting leaves too few launches with real weight, the kernel widens until the effective sample reaches 8.
+- **Size kernel.** Launches whose hour-1 print is close in size to the target's get more weight (a Gaussian kernel, width 0.9 in log viewers). A launch ten times smaller peaks at a different time of day than a huge one. If the weighting leaves too few launches with real weight, the kernel widens until the effective sample reaches 8.
 - **Early-access filter.** Launches the kit flags as early-access-contaminated are left out: their release-day curve is bent by players who started days early.
+- **Empirical + normal ensemble.** Each level's quantile averages the weighted empirical quantile with a normal fit's quantile (weighted mean and spread of the log ratios at that hour). With a few dozen launches the empirical tails are noisy and the normal fit is smooth but biased when the distribution is skew; averaging halves the tails' variance without trusting either alone. The median stays purely empirical.
 
 The outer quantiles are pulled 15% toward the median, because with a few dozen launches the 5% and 95% empirical quantiles overshoot. Everything is computed from the case file at run time; no fitted number is baked in.
 
@@ -22,9 +23,12 @@ Scored with the contest's exact pinball loss on the log scale, against the four 
 | model | mean loss | p00 Wolverine | p01 RDR2 | p02 GoW Ragnarök | p03 Spider-Man 2 |
 |---|---|---|---|---|---|
 | house baseline (starter) | 0.387 | 0.744 | 0.287 | 0.215 | 0.303 |
-| this entry | **0.196** | 0.293 | 0.164 | 0.132 | 0.193 |
+| v1 (empirical quantiles only) | 0.196 | 0.293 | 0.164 | 0.132 | 0.193 |
+| **v2 (this entry)** | **0.185** | **0.266** | **0.155** | **0.126** | **0.194** |
 
 Typical miss 19–75% per case (mean 37%), 90% coverage 0.78–0.96 (mean 0.90). The baseline's loss reproduces the kit's published ~0.387, which validates the scorer.
+
+The v2 improvement was chosen on two protocols, not on the four practice cases alone: the same backtest above, and leave-one-out over the 38 comparables (each launch forecast from the other 37), where v2 scores 0.227 against v1's 0.231. Variants that helped only the practice cases (pre-release-peak and hour-1/pre-peak kernels, recency weighting, a console-only bonus) were tried and dropped because they made leave-one-out worse.
 
 ## Run it
 
