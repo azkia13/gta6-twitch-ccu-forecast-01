@@ -1,7 +1,7 @@
-// Forecast model for gta6-twitch-ccu-forecast-01: an empirical launch-curve
-// forecaster. It learns the shape of a release day from the past launches
-// shipped inside the case file, then scales that shape to the target launch
-// by its own first-hour print.
+// Forecast model for gta6-twitch-ccu-forecast-01: a size-regression launch
+// curve forecaster. It learns the shape of a release day from the past
+// launches shipped inside the case file, then scales that shape to the
+// target launch by its own first-hour print.
 //
 // Idea: for a past launch, the interesting object is not its absolute
 // viewers but its intraday shape - the log ratio of each hour's viewers to
@@ -10,27 +10,51 @@
 // distribution, so the spread is honest: it is the spread real launches
 // actually showed, not a spread guessed in advance.
 //
-// Two weightings keep the distribution relevant to the launch at hand:
+// The shape depends strongly on size. A small category barely exists at
+// hour 1 and then explodes 50-100x at unlock, while a huge launch is
+// already enormous at hour 1 and stays near flat: across the comparables
+// the correlation between log hour-1 viewers and the mean log ratio is
+// about -0.88, a slope of roughly -0.54 per log unit of size, steepest in
+// the evening hours (about -0.9) and near zero in the small hours. A
+// size kernel alone cannot capture a trend this steep: it either
+// localises so tightly that the sample starves, or it averages launches
+// whose shapes differ by an order of magnitude. So each hour's centre is
+// a weighted linear regression of the log ratio on log hour-1 size,
+// predicted at the target's own size. The regression uses every launch
+// with data at that hour, weighted by a Gaussian size kernel (width 1.5
+// in log viewers, widened until the effective sample reaches 8), so
+// near-size launches still dominate the fit while far ones stabilise it.
+//
+// Two weightings keep the fit relevant to the launch at hand:
 //   1. Launches whose hour-1 print is close in size to the target's get
-//      more weight (a Gaussian kernel on the log hour-1 ratio). A launch
-//      ten times smaller peaks at a different time of day than a huge one.
+//      more weight in the regression (a Gaussian kernel on the log
+//      hour-1 ratio). If the weighting leaves too few launches with real
+//      weight, the kernel widens until the effective sample is big enough
+//      to trust.
 //   2. Launches the kit flags as early-access-contaminated are left out:
 //      their release-day curve is bent by players who started days early.
-// If the weighting leaves too few launches with real weight, the kernel
-// widens until the effective sample is big enough to trust.
 //
-// The quantiles themselves are an ensemble of two estimators of the same
-// per-hour distribution of log ratios. With only a few dozen launches the
-// empirical quantiles are noisy, worst at the 5% and 95% tails, while a
-// normal fit (weighted mean and spread of the log ratios) is smooth but
-// biased when the distribution is skew. Averaging the two halves the
-// variance of the tails without trusting either one alone; the median
-// stays purely empirical, since it is the best-estimated quantile and the
-// anchor every other level is pulled toward.
+// The spread around the regression line is the distribution of the
+// regression residuals at that hour: the quantiles of the forecast are
+// the regression centre plus quantiles of the residuals. The quantiles
+// themselves are an ensemble of two estimators of that residual
+// distribution. With only a few dozen launches the empirical quantiles
+// are noisy, worst at the 5% and 95% tails, while a normal fit (weighted
+// mean and spread of the residuals) is smooth but biased when the
+// distribution is skew. Averaging the two halves the variance of the
+// tails without trusting either one alone.
 //
 // The outer quantiles are pulled 15% toward the median: with a few dozen
 // launches the 5% and 95% empirical quantiles overshoot, and the pinball
-// loss punishes an over-wide band at every hour. The median is untouched.
+// loss punishes an over-wide band at every hour. The median is the
+// regression centre plus the residual median, untouched by the pull.
+//
+// Beyond the size range the comparables cover, the regression slope is
+// halved: the size trend flattens at the top end (the biggest launches
+// sit above the straight-line fit in the evening), so a straight
+// extrapolation would under-predict a launch bigger than every
+// comparable - exactly the situation Grand Theft Auto VI is in.
+//
 // Everything is computed from the case file at run time; no fitted number
 // is baked in, so the same program runs the final case unchanged.
 
@@ -58,7 +82,7 @@ export interface CaseFile {
 export const LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95];
 
 /** Width of the size kernel, in natural-log units of hour-1 viewers. */
-const SIZE_KERNEL_WIDTH = 0.9;
+const SIZE_KERNEL_WIDTH = 1.5;
 /** How far the outer quantiles are pulled toward the median (1 = no pull). */
 const SPREAD_PULL = 0.85;
 /** Weight of the normal-fit quantiles in the ensemble (0 = purely empirical). */
@@ -71,6 +95,8 @@ const MIN_EFFECTIVE_LAUNCHES = 8;
 const MAX_KERNEL_WIDTH = 3.0;
 /** Smallest number of launches that may inform one hour at all. */
 const MIN_LAUNCHES_PER_HOUR = 5;
+/** Slope kept beyond the observed size range (1 = straight extrapolation). */
+const SLOPE_SHRINK = 0.5;
 
 /** A launch's release-day curve, reduced to its hour-1 print and the
  *  log ratio of every later hour to it. Hours with no usable point are
@@ -163,9 +189,8 @@ export function weightedQuantile(pairs: Array<[number, number]>, tau: number): n
   return last[1];
 }
 
-/** Weighted mean and standard deviation of a weighted sample of log
- *  ratios: the normal fit the ensemble blends against the empirical
- *  quantiles. */
+/** Weighted mean and standard deviation of a weighted sample: the normal
+ *  fit the ensemble blends against the empirical quantiles. */
 function weightedMeanSd(pairs: Array<[number, number]>): [number, number] {
   let total = 0;
   let mean = 0;
@@ -182,39 +207,86 @@ function weightedMeanSd(pairs: Array<[number, number]>): [number, number] {
   return [mean, Math.sqrt(variance / total)];
 }
 
+/** Weighted least squares of y on x: returns [intercept, slope] for the
+ *  line y = a + b*x. Triples are (x, y, weight). A zero spread in x falls
+ *  back to the weighted mean with a flat slope. */
+function weightedLeastSquares(triples: Array<[number, number, number]>): [number, number] {
+  let total = 0;
+  let meanX = 0;
+  let meanY = 0;
+  for (const [x, y, w] of triples) {
+    total += w;
+    meanX += x * w;
+    meanY += y * w;
+  }
+  if (total <= 0) return [triples[0][1], 0];
+  meanX /= total;
+  meanY /= total;
+  let sxx = 0;
+  let sxy = 0;
+  for (const [x, y, w] of triples) {
+    sxx += w * (x - meanX) * (x - meanX);
+    sxy += w * (x - meanX) * (y - meanY);
+  }
+  if (sxx <= 0) return [meanY, 0];
+  const slope = sxy / sxx;
+  return [meanY - slope * meanX, slope];
+}
+
 /** The five quantiles of one hour's log ratio, as viewer counts. The
- *  median anchors the forecast and stays purely empirical; every level's
- *  quantile is the average of the empirical quantile and the normal
- *  fit's quantile at that level, and the outer quantiles are pulled
- *  toward the median by SPREAD_PULL so a thin sample does not overstate
- *  the spread. */
+ *  centre is the size regression's prediction at the target's size; the
+ *  spread is the residual distribution around that line, as the average
+ *  of its empirical quantiles and a normal fit's quantiles, with the
+ *  outer quantiles pulled toward the residual median by SPREAD_PULL. */
 function hourQuantiles(
   shapes: LaunchShape[],
   hour: number,
   targetHourOne: number,
 ): number[] | null {
   let width = SIZE_KERNEL_WIDTH;
-  let pairs: Array<[number, number]> = [];
+  let triples: Array<[number, number, number]> = [];
   // Widen the kernel until enough launches carry real weight, or the cap.
   while (true) {
-    pairs = [];
+    triples = [];
     for (const shape of shapes) {
       const ratio = shape.logRatio.get(hour);
       if (ratio === undefined) continue;
-      pairs.push([ratio, sizeWeight(shape.hourOne, targetHourOne, width)]);
+      triples.push([Math.log(shape.hourOne), ratio, sizeWeight(shape.hourOne, targetHourOne, width)]);
     }
-    if (pairs.length < MIN_LAUNCHES_PER_HOUR) return null;
-    if (effectiveCount(pairs.map(([, w]) => w)) >= MIN_EFFECTIVE_LAUNCHES) break;
+    if (triples.length < MIN_LAUNCHES_PER_HOUR) return null;
+    if (effectiveCount(triples.map(([, , w]) => w)) >= MIN_EFFECTIVE_LAUNCHES) break;
     if (width >= MAX_KERNEL_WIDTH) break;
     width *= 1.25;
   }
-  const median = weightedQuantile(pairs, 0.5);
-  const [mean, sd] = weightedMeanSd(pairs);
+  const [intercept, slope] = weightedLeastSquares(triples);
+  const targetX = Math.log(targetHourOne);
+  let centre = intercept + slope * targetX;
+  // Beyond the size range the comparables cover, keep only half the
+  // slope: the size trend flattens at the top end, so a straight
+  // extrapolation would under-predict a launch bigger than every
+  // comparable - exactly the situation Grand Theft Auto VI is in.
+  let minX = Infinity;
+  let maxX = -Infinity;
+  for (const [x] of triples) {
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+  }
+  if (targetX > maxX) {
+    centre = intercept + slope * maxX + slope * SLOPE_SHRINK * (targetX - maxX);
+  } else if (targetX < minX) {
+    centre = intercept + slope * minX + slope * SLOPE_SHRINK * (targetX - minX);
+  }
+  const residuals: Array<[number, number]> = triples.map(([x, y, w]) => [
+    y - (intercept + slope * x),
+    w,
+  ]);
+  const median = weightedQuantile(residuals, 0.5);
+  const [mean, sd] = weightedMeanSd(residuals);
   return LEVELS.map((tau, i) => {
-    const empirical = weightedQuantile(pairs, tau);
+    const empirical = weightedQuantile(residuals, tau);
     const normal = mean + NORMAL_Z[i] * sd;
     const q = (1 - NORMAL_BLEND) * empirical + NORMAL_BLEND * normal;
-    return targetHourOne * Math.exp(median + SPREAD_PULL * (q - median));
+    return targetHourOne * Math.exp(centre + median + SPREAD_PULL * (q - median));
   });
 }
 
